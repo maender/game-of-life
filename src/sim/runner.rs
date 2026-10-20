@@ -185,20 +185,20 @@ fn run_simulation_loop(
                             }
                             SimCommand::Edit(edits) => {
                                 apply_edits(&mut universe, edits);
-                                publish_edit_snapshot(&snapshot, &universe, running);
+                                publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                             }
                             SimCommand::Randomize { rect, density } => {
                                 universe.fill_random(rect, density, randomize_seed_counter);
                                 randomize_seed_counter += 1;
-                                publish_edit_snapshot(&snapshot, &universe, running);
+                                publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                             }
                             SimCommand::Clear => {
                                 universe.clear();
-                                publish_edit_snapshot(&snapshot, &universe, running);
+                                publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                             }
                             SimCommand::SetEffects(on) => {
                                 universe.set_effects(on);
-                                publish_edit_snapshot(&snapshot, &universe, running);
+                                publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                             }
                         }
                     }
@@ -211,6 +211,10 @@ fn run_simulation_loop(
                         return;
                     }
                 }
+            }
+            if !running {
+                // Paused during the drain: no further generation.
+                continue;
             }
 
             // Do a step
@@ -275,23 +279,23 @@ fn run_simulation_loop(
                                     }
                                     SimCommand::Edit(edits) => {
                                         apply_edits(&mut universe, edits);
-                                        publish_edit_snapshot(&snapshot, &universe, running);
+                                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                                         // Continue waiting after edit
                                     }
                                     SimCommand::Randomize { rect, density } => {
                                         universe.fill_random(rect, density, randomize_seed_counter);
                                         randomize_seed_counter += 1;
-                                        publish_edit_snapshot(&snapshot, &universe, running);
+                                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                                         // Continue waiting
                                     }
                                     SimCommand::Clear => {
                                         universe.clear();
-                                        publish_edit_snapshot(&snapshot, &universe, running);
+                                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                                         // Continue waiting
                                     }
                                     SimCommand::SetEffects(on) => {
                                         universe.set_effects(on);
-                                        publish_edit_snapshot(&snapshot, &universe, running);
+                                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                                         // Continue waiting
                                     }
                                 }
@@ -344,20 +348,20 @@ fn run_simulation_loop(
                     }
                     SimCommand::Edit(edits) => {
                         apply_edits(&mut universe, edits);
-                        publish_edit_snapshot(&snapshot, &universe, running);
+                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                     }
                     SimCommand::Randomize { rect, density } => {
                         universe.fill_random(rect, density, randomize_seed_counter);
                         randomize_seed_counter += 1;
-                        publish_edit_snapshot(&snapshot, &universe, running);
+                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                     }
                     SimCommand::Clear => {
                         universe.clear();
-                        publish_edit_snapshot(&snapshot, &universe, running);
+                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                     }
                     SimCommand::SetEffects(on) => {
                         universe.set_effects(on);
-                        publish_edit_snapshot(&snapshot, &universe, running);
+                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
                     }
                 },
                 Err(_) => {
@@ -375,26 +379,8 @@ fn apply_edits(universe: &mut Universe, edits: Vec<(i64, i64, bool)>) {
     }
 }
 
-fn publish_edit_snapshot(
-    snapshot: &Arc<ArcSwap<Snapshot>>,
-    universe: &Universe,
-    running: bool,
-) {
-    // For edits, prev == tiles (no animation)
-    let tiles = universe.tiles().clone();
-    let new_snapshot = Snapshot {
-        tiles: tiles.clone(),
-        prev: tiles,
-        meta: universe.meta().cloned(),
-        generation: universe.generation(),
-        population: universe.population(),
-        running,
-        gens_per_sec: 0.0,
-        published_at: Instant::now(),
-    };
-    snapshot.store(Arc::new(new_snapshot));
-}
-
+/// Publishes the current state without animation (prev == tiles), keeping
+/// the measured generation rate.
 fn publish_snapshot(
     snapshot: &Arc<ArcSwap<Snapshot>>,
     universe: &Universe,
@@ -647,6 +633,55 @@ mod tests {
         }
 
         handle.send(SimCommand::Pause);
+    }
+
+    /// At Max speed Pause lands in the command drain: it must not run one more
+    /// generation nor leave a `running: true` snapshot behind.
+    #[test]
+    fn pause_at_max_speed_stops() {
+        let handle = spawn(Universe::new());
+        handle.send(SimCommand::SetSpeed(Speed::Max));
+        handle.send(SimCommand::Play);
+        assert!(wait_for_generation(&handle, 10, Duration::from_secs(2)));
+
+        handle.send(SimCommand::Pause);
+        let start = Instant::now();
+        while handle.snapshot().running {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "snapshot still running 2 s after Pause"
+            );
+            sleep(Duration::from_millis(10));
+        }
+        let paused_at = handle.snapshot().generation;
+        sleep(Duration::from_millis(100));
+        let snap = handle.snapshot();
+        assert!(!snap.running);
+        assert_eq!(snap.generation, paused_at, "generation moved after Pause");
+    }
+
+    /// An edit while running keeps the measured rate in its snapshot. A lone
+    /// cell dies on the next step, so seeing it means seeing the edit snapshot.
+    #[test]
+    fn edit_snapshot_keeps_gens_per_sec() {
+        let handle = spawn(Universe::new());
+        // At 1 gen/s the edit lands ~0.7 s before the step that kills it.
+        handle.send(SimCommand::SetSpeed(Speed::Gps(1)));
+        handle.send(SimCommand::Play);
+        sleep(Duration::from_millis(1300));
+
+        handle.send(SimCommand::Edit(vec![(700, 700, true)]));
+        let (tc, lx, ly) = crate::sim::split(700, 700);
+        let start = Instant::now();
+        let snap = loop {
+            let snap = handle.snapshot();
+            if snap.tiles.get(&tc).is_some_and(|t| t.get(lx, ly)) {
+                break snap;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2), "edit not seen");
+            thread::yield_now();
+        };
+        assert!(snap.gens_per_sec > 0.0, "edit snapshot reset gens_per_sec");
     }
 
     #[test]
