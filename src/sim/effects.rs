@@ -1,4 +1,4 @@
-use crate::sim::{TileCoord, TileMap};
+use crate::sim::{Tile, TileCoord, TileMap};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -14,67 +14,129 @@ pub struct TileMeta {
 pub type MetaMap = FxHashMap<TileCoord, TileMeta>;
 
 pub fn update_meta(old: &MetaMap, new_tiles: &TileMap) -> MetaMap {
-    // Collect all tile coordinates from old meta and new tiles
-    let mut all_coords = std::collections::HashSet::new();
-    for &coord in old.keys() {
-        all_coords.insert(coord);
-    }
-    for &coord in new_tiles.keys() {
-        all_coords.insert(coord);
-    }
-
-    // Process each tile in parallel
-    all_coords
+    // Tiles alive now, then tiles only in the old meta (fading trails): the
+    // two parts are disjoint, so no set union is needed.
+    let empty = Tile::default();
+    let live = new_tiles
         .par_iter()
-        .filter_map(|&coord| {
-            let old_tile_meta = old.get(&coord);
-            let new_tile = new_tiles.get(&coord);
+        .filter_map(|(&coord, tile)| next_tile_meta(old.get(&coord), tile).map(|m| (coord, m)));
+    let fading = old
+        .par_iter()
+        .filter(|(coord, _)| !new_tiles.contains_key(coord))
+        .filter_map(|(&coord, meta)| next_tile_meta(Some(meta), &empty).map(|m| (coord, m)));
+    live.chain(fading).collect()
+}
 
-            let mut tile_meta = TileMeta {
-                age: [0; 4096],
-                trail: [0; 4096],
-            };
-
-            let mut has_data = false;
-
-            // Process each cell in the tile
-            for ly in 0..64 {
+/// Next meta of one tile, or `None` if it holds no live cell and no trail.
+fn next_tile_meta(old: Option<&TileMeta>, tile: &Tile) -> Option<TileMeta> {
+    let mut meta = TileMeta {
+        age: [0; 4096],
+        trail: [0; 4096],
+    };
+    for (ly, &row) in tile.rows.iter().enumerate() {
+        // 0xff for live cells, 0 for dead ones (branchless, vectorizable).
+        let alive: [u8; 64] = std::array::from_fn(|lx| 0u8.wrapping_sub(((row >> lx) & 1) as u8));
+        let range = ly * 64..ly * 64 + 64;
+        let (age, trail) = (&mut meta.age[range.clone()], &mut meta.trail[range.clone()]);
+        match old {
+            Some(o) => {
+                let (old_age, old_trail) = (&o.age[range.clone()], &o.trail[range]);
                 for lx in 0..64 {
-                    let idx = ly * 64 + lx;
-                    let is_alive = new_tile.map_or(false, |tile| tile.get(lx, ly));
-
-                    if is_alive {
-                        // Alive cell: age increases (up to AGE_MAX), trail is TRAIL_LEN
-                        let old_age = old_tile_meta.map_or(0, |meta| meta.age[idx]);
-                        tile_meta.age[idx] = old_age.saturating_add(1).min(AGE_MAX);
-                        tile_meta.trail[idx] = TRAIL_LEN;
-                        has_data = true;
-                    } else {
-                        // Dead cell: age is 0, trail decreases
-                        tile_meta.age[idx] = 0;
-                        let old_trail = old_tile_meta.map_or(0, |meta| meta.trail[idx]);
-                        tile_meta.trail[idx] = old_trail.saturating_sub(1);
-                        if tile_meta.trail[idx] > 0 {
-                            has_data = true;
-                        }
-                    }
+                    let m = alive[lx];
+                    age[lx] = old_age[lx].saturating_add(1).min(AGE_MAX) & m;
+                    trail[lx] = (TRAIL_LEN & m) | (old_trail[lx].saturating_sub(1) & !m);
                 }
             }
-
-            // Only include tile if it has data
-            if has_data {
-                Some((coord, tile_meta))
-            } else {
-                None
+            None => {
+                for lx in 0..64 {
+                    age[lx] = 1 & alive[lx];
+                    trail[lx] = TRAIL_LEN & alive[lx];
+                }
             }
-        })
-        .collect()
+        }
+    }
+    let has_data = !tile.is_empty() || meta.trail.iter().any(|&t| t > 0);
+    has_data.then_some(meta)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sim::Universe;
+
+    /// Per-cell reference of the age/trail rules, over the union of both maps.
+    fn update_meta_reference(old: &MetaMap, new_tiles: &TileMap) -> MetaMap {
+        let mut coords: Vec<TileCoord> = old.keys().chain(new_tiles.keys()).copied().collect();
+        coords.sort();
+        coords.dedup();
+        let mut out = MetaMap::default();
+        for coord in coords {
+            let mut m = TileMeta {
+                age: [0; 4096],
+                trail: [0; 4096],
+            };
+            for ly in 0..64 {
+                for lx in 0..64 {
+                    let idx = ly * 64 + lx;
+                    let alive = new_tiles.get(&coord).is_some_and(|t| t.get(lx, ly));
+                    let (old_age, old_trail) = old
+                        .get(&coord)
+                        .map_or((0, 0), |o| (o.age[idx], o.trail[idx]));
+                    if alive {
+                        m.age[idx] = old_age.saturating_add(1).min(AGE_MAX);
+                        m.trail[idx] = TRAIL_LEN;
+                    } else {
+                        m.trail[idx] = old_trail.saturating_sub(1);
+                    }
+                }
+            }
+            if m.age.iter().any(|&a| a > 0) || m.trail.iter().any(|&t| t > 0) {
+                out.insert(coord, m);
+            }
+        }
+        out
+    }
+
+    fn assert_same_meta(a: &MetaMap, b: &MetaMap) {
+        assert_eq!(a.len(), b.len(), "tile counts differ");
+        for (coord, ma) in a {
+            let mb = b
+                .get(coord)
+                .unwrap_or_else(|| panic!("tile {:?} missing", coord));
+            assert!(ma.age == mb.age, "age differs in tile {:?}", coord);
+            assert!(ma.trail == mb.trail, "trail differs in tile {:?}", coord);
+        }
+    }
+
+    #[test]
+    fn update_meta_matches_reference_on_soup() {
+        use crate::sim::CellRect;
+        let mut u = Universe::new();
+        u.fill_random(
+            CellRect {
+                x0: -200,
+                y0: -130,
+                x1: 190,
+                y1: 140,
+            },
+            0.35,
+            7,
+        );
+        u.set_effects(true);
+        for _ in 0..40 {
+            let old = u.meta().expect("meta").clone();
+            u.step();
+            let expected = update_meta_reference(&old, u.tiles());
+            assert_same_meta(u.meta().expect("meta"), &expected);
+        }
+        // Also compare once all cells are gone: only fading trails remain.
+        let old = u.meta().expect("meta").clone();
+        let empty = TileMap::default();
+        assert_same_meta(
+            &update_meta(&old, &empty),
+            &update_meta_reference(&old, &empty),
+        );
+    }
 
     #[test]
     fn block_ages_to_cap() {
@@ -101,7 +163,11 @@ mod tests {
         for ly in 0..2 {
             for lx in 0..2 {
                 let idx = ly * 64 + lx;
-                assert_eq!(tile_meta.age[idx], AGE_MAX, "Cell ({}, {}) should have age {}", lx, ly, AGE_MAX);
+                assert_eq!(
+                    tile_meta.age[idx], AGE_MAX,
+                    "Cell ({}, {}) should have age {}",
+                    lx, ly, AGE_MAX
+                );
             }
         }
     }
@@ -122,7 +188,12 @@ mod tests {
         let meta = u.meta().expect("Meta should exist");
         let tile_meta = meta.get(&(0, 0)).expect("Meta tile should exist");
         let idx = 10 * 64 + 10;
-        assert_eq!(tile_meta.trail[idx], TRAIL_LEN - 1, "Trail should be {} after cell dies", TRAIL_LEN - 1);
+        assert_eq!(
+            tile_meta.trail[idx],
+            TRAIL_LEN - 1,
+            "Trail should be {} after cell dies",
+            TRAIL_LEN - 1
+        );
 
         // Step TRAIL_LEN more times
         for _ in 0..TRAIL_LEN {
@@ -135,7 +206,10 @@ mod tests {
             assert_eq!(tile_meta.trail[idx], 0, "Trail should have faded to 0");
         }
         // Actually, the tile should be removed
-        assert!(meta.get(&(0, 0)).is_none(), "Meta tile should be removed when no cells alive and no trail");
+        assert!(
+            meta.get(&(0, 0)).is_none(),
+            "Meta tile should be removed when no cells alive and no trail"
+        );
     }
 
     #[test]
@@ -151,10 +225,16 @@ mod tests {
 
         // Turn effects on then off
         u.set_effects(true);
-        assert!(u.meta().is_some(), "Meta should exist after enabling effects");
+        assert!(
+            u.meta().is_some(),
+            "Meta should exist after enabling effects"
+        );
 
         u.set_effects(false);
-        assert!(u.meta().is_none(), "Meta should be None after disabling effects");
+        assert!(
+            u.meta().is_none(),
+            "Meta should be None after disabling effects"
+        );
     }
 
     #[test]
@@ -184,6 +264,9 @@ mod tests {
         let idx_right = 1 * 64 + 2; // (2, 1)
 
         assert_eq!(tile_meta.age[idx_left], 1, "Newborn cell should have age 1");
-        assert_eq!(tile_meta.age[idx_right], 1, "Newborn cell should have age 1");
+        assert_eq!(
+            tile_meta.age[idx_right], 1,
+            "Newborn cell should have age 1"
+        );
     }
 }
