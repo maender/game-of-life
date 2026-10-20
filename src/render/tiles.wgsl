@@ -237,8 +237,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var light = clamp(u.base_hsl.z + r2 * 0.07 * k, 0.0, 1.0);
     let sat = u.base_hsl.y;
     if alive && (u.flags & FLAG_AGE) != 0u {
-        // +25% lightness when born down to -10% at AGE_MAX (as in the mockup).
-        let a = min(f32(cell_age(t, cx, cy)), AGE_MAX) / AGE_MAX;
+        // +25% lightness when born (age 1) down to -10% at AGE_MAX.
+        let a = (clamp(f32(cell_age(t, cx, cy)), 1.0, AGE_MAX) - 1.0) / (AGE_MAX - 1.0);
         light = clamp(u.base_hsl.z + 0.25 - a * 0.35 + r2 * 0.04 * k, 0.12, 0.92);
     }
     let col = vec3<f32>(hue, sat, light);

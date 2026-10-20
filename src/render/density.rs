@@ -120,13 +120,22 @@ struct Uniforms {
 }
 
 /// What the density texture currently holds.
-#[derive(PartialEq)]
 struct GridKey {
-    tiles: *const TileMap,
+    tiles: Arc<TileMap>,
     center: (f64, f64),
     px_per_cell: f64,
     screen: (f64, f64),
     div: u32,
+}
+
+impl GridKey {
+    fn same_as(&self, other: &GridKey) -> bool {
+        Arc::ptr_eq(&self.tiles, &other.tiles)
+            && self.center == other.center
+            && self.px_per_cell == other.px_per_cell
+            && self.screen == other.screen
+            && self.div == other.div
+    }
 }
 
 /// Grid computations slower than this (half a 60 FPS frame) switch to half resolution.
@@ -240,13 +249,13 @@ impl DensityView {
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
         let key = GridKey {
-            tiles: Arc::as_ptr(tiles),
+            tiles: tiles.clone(),
             center: cam.center,
             px_per_cell: cam.px_per_cell,
             screen: cam.screen,
             div: self.div,
         };
-        if self.key.as_ref() == Some(&key) {
+        if self.key.as_ref().is_some_and(|k| k.same_as(&key)) {
             return;
         }
         let out_w = ((cam.screen.0 as u32) / self.div).max(1);
@@ -358,5 +367,31 @@ mod tests {
         let mut tiles = TileMap::default();
         tiles.insert((0, 0), Tile { rows });
         assert_center_only(&density_grid(&tiles, &far_cam(), 3, 3), 0.5);
+    }
+
+    #[test]
+    fn density_sub_block_negative_coords() {
+        // Tile (-1, 0) covers cells x -64..-1, y 0..63; at 1/32 px per cell
+        // each pixel holds 32x32 cells. Left half of the tile is full, right
+        // half (columns 32..63) has only its top 16 rows alive.
+        let mut rows = [u32::MAX as u64; 64];
+        for (ly, row) in rows.iter_mut().enumerate() {
+            if ly < 16 {
+                *row = u64::MAX;
+            }
+        }
+        let mut tiles = TileMap::default();
+        tiles.insert((-1, 0), Tile { rows });
+        let cam = Camera {
+            center: (0.0, 32.0),
+            px_per_cell: 1.0 / 32.0,
+            screen: (4.0, 2.0),
+        };
+        let grid = density_grid(&tiles, &cam, 4, 2);
+        // Pixel columns: x -64..-32, -32..0, 0..32, 32..64; rows: y 0..32, 32..64.
+        let expected = [1.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        for (i, (v, e)) in grid.iter().zip(expected).enumerate() {
+            assert!((v - e).abs() <= 1e-6, "pixel {i}: {v} != {e}");
+        }
     }
 }
