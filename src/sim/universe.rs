@@ -198,40 +198,62 @@ impl Universe {
     }
 
     pub fn fill_random(&mut self, rect: CellRect, density: f32, seed: u64) {
-        // Clear the rect first
         let tx0 = rect.x0.div_euclid(TILE);
         let ty0 = rect.y0.div_euclid(TILE);
         let tx1 = (rect.x1 - 1).div_euclid(TILE) + 1;
         let ty1 = (rect.y1 - 1).div_euclid(TILE) + 1;
 
-        // Remove cells in the rect
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                if self.get(x, y) {
-                    self.set(x, y, false);
-                }
-            }
-        }
-
-        // Fill in parallel by tile
         let density_byte = (density * 256.0).round() as u32;
+        let old_tiles = &self.tiles;
 
-        let new_tiles: Vec<(TileCoord, Tile)> = (ty0..ty1)
+        // Clear and fill in parallel by tile
+        let new_tiles: Vec<(TileCoord, Tile, i64)> = (ty0..ty1)
             .into_par_iter()
             .flat_map(|ty| {
                 (tx0..tx1).into_par_iter().filter_map(move |tx| {
-                    let mut tile = Tile::default();
+                    // Start with existing tile or empty
+                    let mut tile = old_tiles.get(&(tx, ty)).copied().unwrap_or_default();
+                    let old_pop = tile.population() as i64;
+
+                    // Determine which rows in this tile are affected by rect
+                    let ly0 = if ty * TILE >= rect.y0 {
+                        0
+                    } else {
+                        (rect.y0 - ty * TILE) as usize
+                    };
+                    let ly1 = if (ty + 1) * TILE <= rect.y1 {
+                        64
+                    } else {
+                        (rect.y1 - ty * TILE) as usize
+                    };
+
+                    // Determine which columns in this tile are affected by rect
+                    let lx0 = if tx * TILE >= rect.x0 {
+                        0
+                    } else {
+                        (rect.x0 - tx * TILE) as usize
+                    };
+                    let lx1 = if (tx + 1) * TILE <= rect.x1 {
+                        64
+                    } else {
+                        (rect.x1 - tx * TILE) as usize
+                    };
+
+                    // Build column mask for the rect region
+                    let mut col_mask = 0u64;
+                    for lx in lx0..lx1 {
+                        col_mask |= 1u64 << lx;
+                    }
+
+                    // Clear the rect region in affected rows
+                    for ly in ly0..ly1 {
+                        tile.rows[ly] &= !col_mask;
+                    }
+
+                    // Fill with random cells
                     let mut rng = TileRng::new(seed, tx, ty);
-
-                    for ly in 0..64 {
-                        let y = ty * TILE + ly as i64;
-                        if y < rect.y0 || y >= rect.y1 {
-                            continue;
-                        }
-
-                        // Generate mask for this row using density byte and 8 random words
-                        // The approach: generate 8 random u64 words, and combine them
-                        // based on the bits of density_byte to approximate the density
+                    for ly in ly0..ly1 {
+                        // Generate mask for this row
                         let words = [
                             rng.next(),
                             rng.next(),
@@ -245,7 +267,6 @@ impl Universe {
 
                         let mut row_mask = 0u64;
                         for lx in 0..64 {
-                            // Generate a random byte and compare with density_byte
                             let word_idx = lx / 8;
                             let bit_in_word = (lx % 8) * 8;
                             let random_byte = ((words[word_idx] >> bit_in_word) & 0xFF) as u32;
@@ -255,30 +276,18 @@ impl Universe {
                             }
                         }
 
-                        // Mask out cells outside the x range
-                        let x0_in_tile = if tx * TILE >= rect.x0 {
-                            0
-                        } else {
-                            (rect.x0 - tx * TILE) as usize
-                        };
-                        let x1_in_tile = if (tx + 1) * TILE <= rect.x1 {
-                            64
-                        } else {
-                            (rect.x1 - tx * TILE) as usize
-                        };
-
-                        let mut mask = 0u64;
-                        for lx in x0_in_tile..x1_in_tile {
-                            mask |= 1u64 << lx;
-                        }
-
-                        tile.rows[ly] = row_mask & mask;
+                        // Apply only to rect columns
+                        tile.rows[ly] |= row_mask & col_mask;
                     }
 
+                    let new_pop = tile.population() as i64;
+                    let pop_delta = new_pop - old_pop;
+
                     if !tile.is_empty() {
-                        Some(((tx, ty), tile))
+                        Some(((tx, ty), tile, pop_delta))
                     } else {
-                        None
+                        // Tile is now empty, will be removed
+                        Some(((tx, ty), tile, pop_delta))
                     }
                 })
             })
@@ -286,10 +295,13 @@ impl Universe {
 
         // Update tiles and population
         let tiles = Arc::make_mut(&mut self.tiles);
-        for (coord, tile) in new_tiles {
-            let pop = tile.population() as u64;
-            tiles.insert(coord, tile);
-            self.population += pop;
+        for (coord, tile, pop_delta) in new_tiles {
+            self.population = (self.population as i64 + pop_delta) as u64;
+            if tile.is_empty() {
+                tiles.remove(&coord);
+            } else {
+                tiles.insert(coord, tile);
+            }
         }
     }
 
@@ -363,11 +375,10 @@ mod tests {
         //  .O.
         //  ..O
         //  OOO
-        u.set(61, 60, true);
-        u.set(62, 61, true);
-        u.set(60, 62, true);
-        u.set(61, 62, true);
-        u.set(62, 62, true);
+        let initial_cells = vec![(61, 60), (62, 61), (60, 62), (61, 62), (62, 62)];
+        for &(x, y) in &initial_cells {
+            u.set(x, y, true);
+        }
 
         assert_eq!(u.population(), 5);
 
@@ -377,11 +388,29 @@ mod tests {
                 u.step();
             }
             assert_eq!(u.population(), 5, "Population should remain 5 at k={}", k);
-            // Check that the glider has moved to (60+k, 60+k)
-            // The glider should be centered around (60+k, 60+k)
         }
 
         assert_eq!(u.generation(), 40);
+
+        // Verify exact positions at k=10: glider should be at initial + (10, 10)
+        let expected: HashSet<(i64, i64)> = initial_cells
+            .iter()
+            .map(|&(x, y)| (x + 10, y + 10))
+            .collect();
+
+        let mut actual = HashSet::new();
+        for y in 50..90 {
+            for x in 50..90 {
+                if u.get(x, y) {
+                    actual.insert((x, y));
+                }
+            }
+        }
+
+        assert_eq!(
+            actual, expected,
+            "Glider not at expected position after 40 generations"
+        );
     }
 
     #[test]
