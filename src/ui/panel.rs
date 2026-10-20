@@ -200,7 +200,7 @@ fn full_panel(
 
 fn collapsed_bar(ui: &mut egui::Ui, snap: &Snapshot, fps: f32, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
-        ui.label(if snap.running { "▶" } else { "⏸" });
+        ui.label(if snap.running { "⏸" } else { "▶" });
         ui.label(stats(format!(
             "Gén {} · {} · {} FPS",
             fmt_int(snap.generation),
@@ -352,6 +352,119 @@ mod tests {
                 .collect()
         });
         assert!(missing.is_empty(), "no glyph for {missing:?}");
+    }
+
+    /// The collapsed bar shows the same icon as the full panel's play button:
+    /// pause while running, play while paused.
+    #[test]
+    fn collapsed_bar_icon_matches_play_button() {
+        let tiles = Arc::new(TileMap::default());
+        let cam = Camera {
+            center: (0.0, 0.0),
+            px_per_cell: 8.0,
+            screen: (800.0, 600.0),
+        };
+        for (running, shown, hidden) in [(true, "⏸", "▶"), (false, "▶", "⏸")] {
+            let ctx = egui::Context::default();
+            let snap = Snapshot {
+                tiles: tiles.clone(),
+                prev: tiles.clone(),
+                meta: None,
+                generation: 0,
+                population: 0,
+                running,
+                gens_per_sec: 0.0,
+                published_at: Instant::now(),
+            };
+            let mut s = Settings {
+                panel_open: false,
+                ..Settings::default()
+            };
+            let mut texts = Vec::new();
+            for _ in 0..2 {
+                let out = ctx.run(egui::RawInput::default(), |ctx| {
+                    draw(ctx, &mut s, &snap, Speed::Gps(30), 60.0, &cam, None);
+                });
+                texts = collect_text(&out.shapes);
+            }
+            let all = texts.concat();
+            assert!(all.contains(shown), "running={running}: missing {shown}");
+            assert!(!all.contains(hidden), "running={running}: unexpected {hidden}");
+        }
+    }
+
+    /// The app lets egui have Escape while `Popup::is_any_open`: opening the
+    /// style combo box must register as an open popup, and Escape closes it.
+    #[test]
+    fn style_combo_is_an_open_popup_until_escape() {
+        let ctx = egui::Context::default();
+        let tiles = Arc::new(TileMap::default());
+        let snap = Snapshot {
+            tiles: tiles.clone(),
+            prev: tiles,
+            meta: None,
+            generation: 0,
+            population: 0,
+            running: false,
+            gens_per_sec: 0.0,
+            published_at: Instant::now(),
+        };
+        let cam = Camera {
+            center: (0.0, 0.0),
+            px_per_cell: 8.0,
+            screen: (800.0, 600.0),
+        };
+        let mut s = Settings::default();
+        let label = s.style.label();
+        let frame = |events: Vec<egui::Event>, s: &mut Settings| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                draw(ctx, s, &snap, Speed::Gps(30), 60.0, &cam, None);
+            })
+        };
+        frame(vec![], &mut s); // the first pass only measures the layout
+        let out = frame(vec![], &mut s);
+        let combo = find_text(&out.shapes, label).expect("style combo drawn");
+        assert!(!egui::Popup::is_any_open(&ctx));
+
+        let pos = combo.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(pos), button(true)], &mut s);
+        frame(vec![button(false)], &mut s);
+        frame(vec![], &mut s);
+        assert!(egui::Popup::is_any_open(&ctx), "combo click opens a popup");
+
+        let esc = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![esc], &mut s);
+        frame(vec![], &mut s);
+        assert!(!egui::Popup::is_any_open(&ctx), "Escape closes the popup");
+    }
+
+    fn find_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == needle => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| walk(&s.shape, needle))
     }
 
     fn collect_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {

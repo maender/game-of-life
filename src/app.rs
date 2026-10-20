@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::ModifiersState;
 use winit::window::{Fullscreen, Window, WindowId};
 
 const START_PX_PER_CELL: f64 = 8.0;
@@ -33,9 +34,9 @@ struct App {
     cam: Camera,
     settings: Settings,
     effects_sent: bool,
-    running: bool,
     speed: Speed,
     cursor: (f64, f64),
+    modifiers: ModifiersState,
     /// Last cell of the stroke in progress (left button held).
     stroke: Option<(i64, i64)>,
     panning: bool,
@@ -58,9 +59,9 @@ pub fn run() {
         },
         settings: Settings::default(),
         effects_sent: false,
-        running: false,
         speed: START_SPEED,
         cursor: (0.0, 0.0),
+        modifiers: ModifiersState::empty(),
         stroke: None,
         panning: false,
         notice_until: None,
@@ -131,11 +132,20 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gfx) = &mut self.gfx else { return };
 
+        if let WindowEvent::ModifiersChanged(m) = &event {
+            self.modifiers = m.state();
+        }
         // Shortcuts go to the app unless egui is editing text; they are not
         // forwarded to egui (Tab would move its focus, Space press a button).
+        // Escape is left to egui while a popup (combo box, colour picker) is
+        // open, so it closes the popup instead of quitting.
         if let WindowEvent::KeyboardInput { event: key, .. } = &event {
-            if !gfx.egui.egui_ctx().wants_keyboard_input() {
-                if let Some(action) = action_for_key(&key.logical_key, key.physical_key) {
+            let ctx = gfx.egui.egui_ctx();
+            if !ctx.wants_keyboard_input() {
+                let popup_open = egui::Popup::is_any_open(ctx);
+                let action = action_for_key(&key.logical_key, key.physical_key, self.modifiers)
+                    .filter(|&a| !(a == Action::Quit && popup_open));
+                if let Some(action) = action {
                     let repeatable =
                         matches!(action, Action::Step | Action::Faster | Action::Slower);
                     if key.state == ElementState::Pressed && (!key.repeat || repeatable) {
@@ -163,17 +173,17 @@ impl ApplicationHandler for App {
                 }
                 self.cursor = (x, y);
                 if let Some(last) = self.stroke {
-                    let cell = self.cam.cell_at(x, y);
-                    if cell != last {
-                        self.paint(line_cells(last, cell));
-                        self.stroke = Some(cell);
+                    let (stroke, cells) = extend_stroke(&self.cam, last, x, y);
+                    self.stroke = stroke;
+                    if !cells.is_empty() {
+                        self.paint(cells);
                     }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left if pressed && !ui_pointer => {
+                    MouseButton::Left if pressed && !ui_pointer && can_draw(&self.cam) => {
                         let cell = self.cam.cell_at(self.cursor.0, self.cursor.1);
                         self.stroke = Some(cell);
                         self.paint(vec![cell]);
@@ -193,6 +203,11 @@ impl ApplicationHandler for App {
             WindowEvent::PinchGesture { delta, .. } if !ui_pointer => {
                 self.cam.zoom_at(self.cursor.0, self.cursor.1, 1.0 + delta);
             }
+            // Button releases are lost while unfocused.
+            WindowEvent::Focused(false) => {
+                self.stroke = None;
+                self.panning = false;
+            }
             WindowEvent::RedrawRequested => self.frame(el),
             _ => {}
         }
@@ -206,9 +221,6 @@ impl App {
 
     /// Sets the given cells to the current tool (draw or erase).
     fn paint(&self, cells: Vec<(i64, i64)>) {
-        if self.cam.px_per_cell < MIN_DRAW_PX_PER_CELL {
-            return;
-        }
         let alive = !self.settings.tool_erase;
         let edits = cells.into_iter().map(|(x, y)| (x, y, alive)).collect();
         self.sim().send(SimCommand::Edit(edits));
@@ -217,20 +229,18 @@ impl App {
     fn apply(&mut self, action: Action, el: &ActiveEventLoop) {
         let s = &mut self.settings;
         match action {
+            // The published snapshot is the single source of truth for the
+            // play state (the panel shows it too); Step is ignored while running.
             Action::TogglePlay => {
-                self.running = !self.running;
-                let cmd = if self.running {
-                    SimCommand::Play
-                } else {
+                let running = self.sim().snapshot().running;
+                let cmd = if running {
                     SimCommand::Pause
+                } else {
+                    SimCommand::Play
                 };
                 self.sim().send(cmd);
             }
-            Action::Step => {
-                if !self.running {
-                    self.sim().send(SimCommand::Step);
-                }
-            }
+            Action::Step => self.sim().send(SimCommand::Step),
             Action::Faster | Action::Slower => {
                 self.speed = if action == Action::Faster {
                     self.speed.faster()
@@ -339,5 +349,64 @@ impl App {
             }
         }
         gfx.window.request_redraw();
+    }
+}
+
+fn can_draw(cam: &Camera) -> bool {
+    cam.px_per_cell >= MIN_DRAW_PX_PER_CELL
+}
+
+/// Moves the stroke from `last` to the cell under the cursor `(x, y)`: returns
+/// the new stroke state and the cells to paint. Below `MIN_DRAW_PX_PER_CELL`
+/// (e.g. zoomed out while holding the button) the stroke ends, before any
+/// line is rasterized across a huge span.
+fn extend_stroke(
+    cam: &Camera,
+    last: (i64, i64),
+    x: f64,
+    y: f64,
+) -> (Option<(i64, i64)>, Vec<(i64, i64)>) {
+    if !can_draw(cam) {
+        return (None, Vec::new());
+    }
+    let cell = cam.cell_at(x, y);
+    if cell == last {
+        return (Some(last), Vec::new());
+    }
+    (Some(cell), line_cells(last, cell))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera(px_per_cell: f64) -> Camera {
+        Camera {
+            center: (0.0, 0.0),
+            px_per_cell,
+            screen: (800.0, 600.0),
+        }
+    }
+
+    #[test]
+    fn stroke_draws_a_line_between_cells() {
+        let cam = camera(8.0);
+        let last = cam.cell_at(400.0, 300.0);
+        let (stroke, cells) = extend_stroke(&cam, last, 400.0 + 3.0 * 8.0, 300.0);
+        assert_eq!(stroke, Some((last.0 + 3, last.1)));
+        assert_eq!(cells.len(), 4);
+        assert_eq!(extend_stroke(&cam, last, 401.0, 300.0), (Some(last), vec![]));
+    }
+
+    #[test]
+    fn stroke_ends_when_zoomed_out() {
+        // Zoomed out past the threshold with the button held: the stroke
+        // stops, no line across the (here billions of cells wide) span.
+        let cam = camera(MIN_DRAW_PX_PER_CELL / 1e9);
+        let (stroke, cells) = extend_stroke(&cam, (0, 0), 0.0, 0.0);
+        assert_eq!(stroke, None);
+        assert!(cells.is_empty());
+        assert!(!can_draw(&cam));
+        assert!(can_draw(&camera(MIN_DRAW_PX_PER_CELL)));
     }
 }

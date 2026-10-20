@@ -1,6 +1,6 @@
 //! Keyboard shortcut table (logical key first, so AZERTY Mac works).
 
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Action {
@@ -25,8 +25,12 @@ pub enum Action {
 
 /// Maps a key press to its action: by produced character (case-insensitive),
 /// with the physical digit row as a fallback for `1` `2` `3` (AZERTY produces
-/// `&` `é` `"` there without Shift).
-pub fn action_for_key(logical: &Key, physical: PhysicalKey) -> Option<Action> {
+/// `&` `é` `"` there without Shift). Chords with Cmd, Ctrl or Alt are left to
+/// the system (Cmd+C must not clear the universe); Shift is allowed.
+pub fn action_for_key(logical: &Key, physical: PhysicalKey, mods: ModifiersState) -> Option<Action> {
+    if mods.super_key() || mods.control_key() || mods.alt_key() {
+        return None;
+    }
     let by_logical = match logical {
         Key::Named(NamedKey::Space) => Some(Action::TogglePlay),
         Key::Named(NamedKey::Tab) => Some(Action::TogglePanel),
@@ -77,7 +81,7 @@ mod tests {
             (NamedKey::Escape, Action::Quit),
         ];
         for (k, a) in named {
-            assert_eq!(action_for_key(&Key::Named(k), NO_CODE), Some(a), "{k:?}");
+            assert_eq!(action_for_key(&Key::Named(k), NO_CODE, ModifiersState::empty()), Some(a), "{k:?}");
         }
         let chars = [
             ("n", Action::Step),
@@ -106,7 +110,7 @@ mod tests {
             ("F", Action::ToggleFullscreen),
         ];
         for (c, a) in chars {
-            assert_eq!(action_for_key(&ch(c), NO_CODE), Some(a), "{c:?}");
+            assert_eq!(action_for_key(&ch(c), NO_CODE, ModifiersState::empty()), Some(a), "{c:?}");
         }
     }
 
@@ -114,21 +118,44 @@ mod tests {
     fn digit_keys_work_on_azerty() {
         let digit = |c| PhysicalKey::Code(c);
         assert_eq!(
-            action_for_key(&ch("&"), digit(KeyCode::Digit1)),
+            action_for_key(&ch("&"), digit(KeyCode::Digit1), ModifiersState::empty()),
             Some(Action::ToggleAge)
         );
         assert_eq!(
-            action_for_key(&ch("é"), digit(KeyCode::Digit2)),
+            action_for_key(&ch("é"), digit(KeyCode::Digit2), ModifiersState::empty()),
             Some(Action::ToggleTrails)
         );
         assert_eq!(
-            action_for_key(&ch("\""), digit(KeyCode::Digit3)),
+            action_for_key(&ch("\""), digit(KeyCode::Digit3), ModifiersState::empty()),
             Some(Action::ToggleAnim)
         );
     }
 
     #[test]
+    fn command_modifiers_disable_shortcuts() {
+        let none = ModifiersState::empty();
+        assert_eq!(
+            action_for_key(&ch("c"), NO_CODE, ModifiersState::SUPER),
+            None
+        );
+        assert_eq!(
+            action_for_key(&ch("r"), NO_CODE, ModifiersState::CONTROL),
+            None
+        );
+        assert_eq!(action_for_key(&ch("n"), NO_CODE, ModifiersState::ALT), None);
+        assert_eq!(
+            action_for_key(&ch("&"), PhysicalKey::Code(KeyCode::Digit1), ModifiersState::SUPER),
+            None
+        );
+        assert_eq!(action_for_key(&ch("c"), NO_CODE, none), Some(Action::Clear));
+        assert_eq!(
+            action_for_key(&ch("+"), NO_CODE, ModifiersState::SHIFT),
+            Some(Action::Faster)
+        );
+    }
+
+    #[test]
     fn unknown_key_is_none() {
-        assert_eq!(action_for_key(&ch("z"), NO_CODE), None);
+        assert_eq!(action_for_key(&ch("z"), NO_CODE, ModifiersState::empty()), None);
     }
 }
