@@ -1,4 +1,4 @@
-use crate::sim::{split, step_tile, Neighborhood, Tile, TileCoord, TILE};
+use crate::sim::{split, step_tile, update_meta, MetaMap, Neighborhood, Tile, TileCoord, TILE};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -49,6 +49,7 @@ pub struct Universe {
     tiles: Arc<TileMap>,
     generation: u64,
     population: u64,
+    meta: Option<Arc<MetaMap>>,
 }
 
 impl Universe {
@@ -57,6 +58,7 @@ impl Universe {
             tiles: Arc::new(TileMap::default()),
             generation: 0,
             population: 0,
+            meta: None,
         }
     }
 
@@ -172,6 +174,12 @@ impl Universe {
         self.generation += 1;
         self.tiles = Arc::new(new_tiles);
 
+        // Update meta if effects are enabled
+        if let Some(ref old_meta) = self.meta {
+            let new_meta = update_meta(old_meta, &self.tiles);
+            self.meta = Some(Arc::new(new_meta));
+        }
+
         old_tiles
     }
 
@@ -195,6 +203,9 @@ impl Universe {
         self.tiles = Arc::new(TileMap::default());
         self.generation = 0;
         self.population = 0;
+        if self.meta.is_some() {
+            self.meta = Some(Arc::new(MetaMap::default()));
+        }
     }
 
     pub fn fill_random(&mut self, rect: CellRect, density: f32, seed: u64) {
@@ -307,6 +318,38 @@ impl Universe {
 
     pub fn bounding_box(&self) -> Option<CellRect> {
         bounding_box(&self.tiles)
+    }
+
+    pub fn set_effects(&mut self, on: bool) {
+        if on {
+            if self.meta.is_none() {
+                // Create meta from current tiles with age 1
+                let mut new_meta = MetaMap::default();
+                for (&coord, tile) in self.tiles.iter() {
+                    let mut tile_meta = crate::sim::TileMeta {
+                        age: [0; 4096],
+                        trail: [0; 4096],
+                    };
+                    for ly in 0..64 {
+                        for lx in 0..64 {
+                            if tile.get(lx, ly) {
+                                let idx = ly * 64 + lx;
+                                tile_meta.age[idx] = 1;
+                                tile_meta.trail[idx] = crate::sim::TRAIL_LEN;
+                            }
+                        }
+                    }
+                    new_meta.insert(coord, tile_meta);
+                }
+                self.meta = Some(Arc::new(new_meta));
+            }
+        } else {
+            self.meta = None;
+        }
+    }
+
+    pub fn meta(&self) -> Option<&Arc<MetaMap>> {
+        self.meta.as_ref()
     }
 }
 
