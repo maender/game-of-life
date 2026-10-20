@@ -1,22 +1,28 @@
-//! Provisional viewer (replaced by `app::run` in Task 9): a static 512x512 soup,
-//! Escape quits, wheel zooms, left drag pans, digits 1-4 pick the style,
-//! 0 toggles degraded mode.
+//! Provisional viewer (replaced by `app::run` in Task 9): a 512x512 soup stepped
+//! on the main thread every 350 ms, Escape quits, Space pauses, wheel zooms,
+//! left drag pans, digits 1-4 pick the style, 0 toggles degraded mode,
+//! 5 / 6 / 7 toggle the age / trail / animation effects.
 //! Env: `GOL_FAR=1` places soup and camera around (1e12, 1e12);
-//! `GOL_FRAMES=n` quits after n frames.
+//! `GOL_FRAMES=n` quits after n frames; `GOL_EFFECTS=1` starts with all
+//! effects on; `GOL_PPC=x` sets the initial pixels per cell.
 
 use gol::render::Renderer;
 use gol::sim::{CellRect, Snapshot, Universe};
 use gol::ui::{CellStyle, Settings};
 use gol::view::Camera;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+const PERIOD: Duration = Duration::from_millis(350);
+
 struct Viewer {
+    universe: Universe,
+    running: bool,
     snap: Snapshot,
     cam: Camera,
     settings: Settings,
@@ -62,8 +68,19 @@ impl ApplicationHandler for Viewer {
                     PhysicalKey::Code(KeyCode::Digit0) => {
                         self.settings.degraded = !self.settings.degraded
                     }
+                    PhysicalKey::Code(KeyCode::Digit5) => {
+                        self.settings.effect_age = !self.settings.effect_age
+                    }
+                    PhysicalKey::Code(KeyCode::Digit6) => {
+                        self.settings.effect_trails = !self.settings.effect_trails
+                    }
+                    PhysicalKey::Code(KeyCode::Digit7) => {
+                        self.settings.effect_anim = !self.settings.effect_anim
+                    }
+                    PhysicalKey::Code(KeyCode::Space) => self.running = !self.running,
                     _ => {}
                 }
+                self.universe.set_effects(self.settings.effects_needed());
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if self.dragging {
@@ -88,8 +105,18 @@ impl ApplicationHandler for Viewer {
                     .zoom_at(self.cursor.0, self.cursor.1, 1.1f64.powf(lines));
             }
             WindowEvent::RedrawRequested => {
+                if self.running && self.snap.published_at.elapsed() >= PERIOD {
+                    let prev = self.universe.step();
+                    self.snap = snapshot(&self.universe, prev);
+                }
+                let anim_t = if self.running {
+                    (self.snap.published_at.elapsed().as_secs_f32() / (0.6 * PERIOD.as_secs_f32()))
+                        .min(1.0)
+                } else {
+                    1.0
+                };
                 if let Some(r) = &mut self.renderer {
-                    r.render(&self.cam, &self.snap, &self.settings, 1.0, None);
+                    r.render(&self.cam, &self.snap, &self.settings, anim_t, None);
                 }
                 if let Some(n) = &mut self.frames_left {
                     *n = n.saturating_sub(1);
@@ -123,25 +150,28 @@ fn main() {
         0.35,
         1,
     );
-    let tiles = universe.tiles().clone();
-    let snap = Snapshot {
-        tiles: tiles.clone(),
-        prev: tiles,
-        meta: None,
-        generation: 0,
-        population: universe.population(),
-        running: false,
-        gens_per_sec: 0.0,
-        published_at: Instant::now(),
-    };
+    let mut settings = Settings::default();
+    if std::env::var_os("GOL_EFFECTS").is_some() {
+        settings.effect_age = true;
+        settings.effect_trails = true;
+        settings.effect_anim = true;
+    }
+    universe.set_effects(settings.effects_needed());
+    let prev = universe.tiles().clone();
+    let snap = snapshot(&universe, prev);
     let mut viewer = Viewer {
+        universe,
+        running: true,
         snap,
         cam: Camera {
             center: (origin as f64, origin as f64),
-            px_per_cell: 8.0,
+            px_per_cell: std::env::var("GOL_PPC")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8.0),
             screen: (1.0, 1.0),
         },
-        settings: Settings::default(),
+        settings,
         renderer: None,
         window: None,
         cursor: (0.0, 0.0),
@@ -153,4 +183,17 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop.run_app(&mut viewer).expect("event loop failed");
+}
+
+fn snapshot(universe: &Universe, prev: Arc<gol::sim::TileMap>) -> Snapshot {
+    Snapshot {
+        tiles: universe.tiles().clone(),
+        prev,
+        meta: universe.meta().cloned(),
+        generation: universe.generation(),
+        population: universe.population(),
+        running: true,
+        gens_per_sec: 0.0,
+        published_at: Instant::now(),
+    }
 }

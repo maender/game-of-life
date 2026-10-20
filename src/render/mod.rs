@@ -1,9 +1,15 @@
 //! GPU rendering of the universe (cells) and of the egui overlay.
 
-use crate::sim::{Snapshot, TileCoord, TileMap, TILE};
+mod density;
+
+pub use density::density_grid;
+
+use crate::sim::{MetaMap, Snapshot, TileCoord, TileMap, TILE};
 use crate::ui::{CellStyle, Settings};
 use crate::view::Camera;
 use bytemuck::{Pod, Zeroable};
+use density::DensityView;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use winit::window::Window;
 
@@ -25,11 +31,21 @@ struct Uniforms {
     variation: f32,
     style: u32,
     flags: u32,
-    _pad: [u32; 2],
+    anim_t: f32,
+    _pad: u32,
 }
 
 const FLAG_DEGRADED: u32 = 1;
 const FLAG_SRGB_TARGET: u32 = 2;
+const FLAG_AGE: u32 = 4;
+const FLAG_TRAILS: u32 = 8;
+const FLAG_ANIM: u32 = 16;
+
+/// Below this zoom the density view replaces the cell path.
+const DENSITY_PX_PER_CELL: f64 = 0.5;
+
+/// Bytes per tile of the age and trail buffers (one u8 per cell).
+const META_BYTES: usize = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -39,11 +55,86 @@ struct GpuTile {
     rows: [u32; 128],
 }
 
-/// What the uploaded tile buffer currently holds.
+/// Inclusive range of tile coordinates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TileRange {
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+}
+
+/// Tiles of `map` inside `range`, by probing the range or scanning the map,
+/// whichever is smaller.
+fn visible_tiles<V>(map: &FxHashMap<TileCoord, V>, range: TileRange) -> Vec<(TileCoord, &V)> {
+    let range_len = ((range.x1 - range.x0 + 1) as u128) * ((range.y1 - range.y0 + 1) as u128);
+    if range_len <= map.len() as u128 {
+        (range.y0..=range.y1)
+            .flat_map(|ty| (range.x0..=range.x1).map(move |tx| (tx, ty)))
+            .filter_map(|c| map.get(&c).map(|v| (c, v)))
+            .collect()
+    } else {
+        map.iter()
+            .filter(|(c, _)| {
+                (range.x0..=range.x1).contains(&c.0) && (range.y0..=range.y1).contains(&c.1)
+            })
+            .map(|(&c, v)| (c, v))
+            .collect()
+    }
+}
+
+/// Effect buffers uploaded alongside the tiles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Effects {
+    age: bool,
+    trails: bool,
+    anim: bool,
+}
+
+/// What the uploaded tile buffers currently hold.
 struct UploadKey {
     tiles: Arc<TileMap>,
+    prev: Option<Arc<TileMap>>,
+    meta: Option<Arc<MetaMap>>,
+    effects: Effects,
     center_tile: TileCoord,
-    range: (i64, i64, i64, i64),
+    range: TileRange,
+}
+
+fn same_arc<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// A storage buffer that grows (to a power of two) on demand.
+struct StorageBuf {
+    buf: wgpu::Buffer,
+    size: u64,
+    label: &'static str,
+}
+
+impl StorageBuf {
+    fn new(device: &wgpu::Device, label: &'static str, size: u64) -> Self {
+        StorageBuf {
+            buf: create_storage_buffer(device, label, size),
+            size,
+            label,
+        }
+    }
+
+    /// Makes room for `bytes`; returns whether the buffer was recreated.
+    fn reserve(&mut self, device: &wgpu::Device, bytes: u64) -> bool {
+        if bytes <= self.size {
+            return false;
+        }
+        let max = device.limits().max_storage_buffer_binding_size as u64;
+        self.size = bytes.next_power_of_two().min(max);
+        self.buf = create_storage_buffer(device, self.label, self.size);
+        true
+    }
 }
 
 pub struct Renderer {
@@ -54,12 +145,18 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_layout: wgpu::BindGroupLayout,
     uniforms: wgpu::Buffer,
-    tile_buf: wgpu::Buffer,
-    tile_capacity: usize,
+    tile_buf: StorageBuf,
+    age_buf: StorageBuf,
+    trail_buf: StorageBuf,
+    prev_buf: StorageBuf,
     bind_group: wgpu::BindGroup,
     tile_count: u32,
     upload_key: Option<UploadKey>,
     staging: Vec<GpuTile>,
+    staging_age: Vec<u8>,
+    staging_trail: Vec<u8>,
+    staging_prev: Vec<[u32; 128]>,
+    density: DensityView,
     egui: egui_wgpu::Renderer,
     window: Arc<Window>,
 }
@@ -105,6 +202,16 @@ impl Renderer {
             label: Some("tiles"),
             source: wgpu::ShaderSource::Wgsl(include_str!("tiles.wgsl").into()),
         });
+        let storage = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tiles"),
             entries: &[
@@ -118,16 +225,10 @@ impl Renderer {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                storage(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                storage(2, wgpu::ShaderStages::FRAGMENT),
+                storage(3, wgpu::ShaderStages::FRAGMENT),
+                storage(4, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -167,9 +268,22 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let tile_capacity = 1024;
-        let tile_buf = create_tile_buffer(&device, tile_capacity);
-        let bind_group = create_bind_group(&device, &bind_layout, &uniforms, &tile_buf);
+        let tile_buf = StorageBuf::new(
+            &device,
+            "tiles",
+            (1024 * std::mem::size_of::<GpuTile>()) as u64,
+        );
+        // Effect buffers start tiny; they only grow once an effect is used.
+        let age_buf = StorageBuf::new(&device, "ages", 16);
+        let trail_buf = StorageBuf::new(&device, "trails", 16);
+        let prev_buf = StorageBuf::new(&device, "prev rows", 16);
+        let bind_group = create_bind_group(
+            &device,
+            &bind_layout,
+            &uniforms,
+            [&tile_buf, &age_buf, &trail_buf, &prev_buf],
+        );
+        let density = DensityView::new(&device, format);
         let egui = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
 
         Renderer {
@@ -181,11 +295,17 @@ impl Renderer {
             bind_layout,
             uniforms,
             tile_buf,
-            tile_capacity,
+            age_buf,
+            trail_buf,
+            prev_buf,
             bind_group,
             tile_count: 0,
             upload_key: None,
             staging: Vec::new(),
+            staging_age: Vec::new(),
+            staging_trail: Vec::new(),
+            staging_prev: Vec::new(),
+            density,
             egui,
             window,
         }
@@ -205,7 +325,7 @@ impl Renderer {
         cam: &Camera,
         snap: &Snapshot,
         s: &Settings,
-        _anim_t: f32,
+        anim_t: f32,
         ui: Option<(&egui::Context, egui::FullOutput)>,
     ) {
         // egui sends each texture delta only once: apply uploads before anything
@@ -235,30 +355,54 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let srgb_target = self.config.format.is_srgb();
+        let screen = [self.config.width as f32, self.config.height as f32];
 
-        let center_tile = (
-            (cam.center.0.floor() as i64).div_euclid(TILE),
-            (cam.center.1.floor() as i64).div_euclid(TILE),
-        );
-        self.upload_tiles(cam, snap, center_tile);
+        let density_view = cam.px_per_cell < DENSITY_PX_PER_CELL;
+        if density_view {
+            self.density.prepare(
+                &self.device,
+                &self.queue,
+                cam,
+                &snap.tiles,
+                s.color,
+                srgb_target,
+                screen,
+            );
+        } else {
+            let center_tile = (
+                (cam.center.0.floor() as i64).div_euclid(TILE),
+                (cam.center.1.floor() as i64).div_euclid(TILE),
+            );
+            let has_meta = snap.meta.is_some();
+            let fx = Effects {
+                age: !s.degraded && s.effect_age && has_meta,
+                trails: !s.degraded && s.effect_trails && has_meta,
+                anim: !s.degraded && s.effect_anim,
+            };
+            self.upload_tiles(cam, snap, center_tile, fx);
 
-        let u = Uniforms {
-            cam_off: [
-                (cam.center.0 - (center_tile.0 * TILE) as f64) as f32,
-                (cam.center.1 - (center_tile.1 * TILE) as f64) as f32,
-            ],
-            screen: [self.config.width as f32, self.config.height as f32],
-            base_rgb: s.color,
-            px_per_cell: cam.px_per_cell as f32,
-            base_hsl: rgb_to_hsl(s.color),
-            variation: s.variation,
-            style: style_index(s.style),
-            flags: if s.degraded { FLAG_DEGRADED } else { 0 }
-                | if srgb_target { FLAG_SRGB_TARGET } else { 0 },
-            _pad: [0; 2],
-        };
-        self.queue
-            .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+            let u = Uniforms {
+                cam_off: [
+                    (cam.center.0 - (center_tile.0 * TILE) as f64) as f32,
+                    (cam.center.1 - (center_tile.1 * TILE) as f64) as f32,
+                ],
+                screen,
+                base_rgb: s.color,
+                px_per_cell: cam.px_per_cell as f32,
+                base_hsl: rgb_to_hsl(s.color),
+                variation: s.variation,
+                style: style_index(s.style),
+                flags: if s.degraded { FLAG_DEGRADED } else { 0 }
+                    | if srgb_target { FLAG_SRGB_TARGET } else { 0 }
+                    | if fx.age { FLAG_AGE } else { 0 }
+                    | if fx.trails { FLAG_TRAILS } else { 0 }
+                    | if fx.anim { FLAG_ANIM } else { 0 },
+                anim_t: anim_t.clamp(0.0, 1.0),
+                _pad: 0,
+            };
+            self.queue
+                .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+        }
 
         let mut encoder = self
             .device
@@ -299,7 +443,9 @@ impl Renderer {
                     occlusion_query_set: None,
                 })
                 .forget_lifetime();
-            if self.tile_count > 0 {
+            if density_view {
+                self.density.draw(&mut pass);
+            } else if self.tile_count > 0 {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.draw(0..6, 0..self.tile_count);
@@ -326,18 +472,30 @@ impl Renderer {
         }
     }
 
-    /// Uploads the visible tiles (plus a one-tile margin) when the snapshot or
-    /// the visible tile range changed.
-    fn upload_tiles(&mut self, cam: &Camera, snap: &Snapshot, center_tile: TileCoord) {
+    /// Uploads the visible tiles (plus a one-tile margin) and the buffers of
+    /// the active effects when the snapshot, the effects or the visible tile
+    /// range changed. Uploaded tiles are the visible live tiles, plus the
+    /// visible meta tiles with trails (trails on dead tiles) and the visible
+    /// previous-generation tiles with animation (cells dying in a dead tile).
+    fn upload_tiles(&mut self, cam: &Camera, snap: &Snapshot, center_tile: TileCoord, fx: Effects) {
         let r = cam.visible_rect();
-        let range = (
-            r.x0.div_euclid(TILE) - 1,
-            r.y0.div_euclid(TILE) - 1,
-            r.x1.div_euclid(TILE) + 1,
-            r.y1.div_euclid(TILE) + 1,
-        );
+        let range = TileRange {
+            x0: r.x0.div_euclid(TILE) - 1,
+            y0: r.y0.div_euclid(TILE) - 1,
+            x1: r.x1.div_euclid(TILE) + 1,
+            y1: r.y1.div_euclid(TILE) + 1,
+        };
+        let prev = fx.anim.then(|| snap.prev.clone());
+        let meta = if fx.age || fx.trails {
+            snap.meta.clone()
+        } else {
+            None
+        };
         if let Some(k) = &self.upload_key {
             if Arc::ptr_eq(&k.tiles, &snap.tiles)
+                && same_arc(&k.prev, &prev)
+                && same_arc(&k.meta, &meta)
+                && k.effects == fx
                 && k.center_tile == center_tile
                 && k.range == range
             {
@@ -345,57 +503,105 @@ impl Renderer {
             }
         }
 
+        let mut coords: Vec<TileCoord> = visible_tiles(&snap.tiles, range)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        if let Some(prev) = &prev {
+            coords.extend(
+                visible_tiles(prev, range)
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .filter(|c| !snap.tiles.contains_key(c)),
+            );
+        }
+        if let (Some(meta), true) = (&meta, fx.trails) {
+            coords.extend(
+                visible_tiles(meta, range)
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .filter(|c| {
+                        !snap.tiles.contains_key(c)
+                            && !prev.as_ref().is_some_and(|p| p.contains_key(c))
+                    }),
+            );
+        }
+
+        // Never exceed what a single storage binding can address.
+        let max_binding = self.device.limits().max_storage_buffer_binding_size as usize;
+        let mut stride = std::mem::size_of::<GpuTile>();
+        if fx.age || fx.trails {
+            stride = stride.max(META_BYTES);
+        }
+        coords.truncate(max_binding / stride);
+
         self.staging.clear();
-        let (tx0, ty0, tx1, ty1) = range;
-        let mut push = |coord: TileCoord, rows: &[u64; 64]| {
-            let t = GpuTile {
+        self.staging_age.clear();
+        self.staging_trail.clear();
+        self.staging_prev.clear();
+        let zero_meta = [0u8; META_BYTES];
+        for &coord in &coords {
+            self.staging.push(GpuTile {
                 rel: [
                     (coord.0 - center_tile.0) as i32,
                     (coord.1 - center_tile.1) as i32,
                 ],
                 abs_lo: [coord.0 as i32, coord.1 as i32],
-                rows: pack_rows(rows),
-            };
-            self.staging.push(t);
-        };
-        let range_len = ((tx1 - tx0 + 1) as u128) * ((ty1 - ty0 + 1) as u128);
-        if range_len <= snap.tiles.len() as u128 {
-            for ty in ty0..=ty1 {
-                for tx in tx0..=tx1 {
-                    if let Some(tile) = snap.tiles.get(&(tx, ty)) {
-                        push((tx, ty), &tile.rows);
-                    }
-                }
+                rows: snap
+                    .tiles
+                    .get(&coord)
+                    .map_or([0; 128], |t| pack_rows(&t.rows)),
+            });
+            let m = meta.as_ref().and_then(|m| m.get(&coord));
+            // Bytes are laid out so that the shader reads cell `i` as byte
+            // `i % 4` (little-endian) of u32 `i / 4`.
+            if fx.age {
+                self.staging_age
+                    .extend_from_slice(m.map_or(&zero_meta, |m| &m.age));
             }
-        } else {
-            for (&coord, tile) in snap.tiles.iter() {
-                if (tx0..=tx1).contains(&coord.0) && (ty0..=ty1).contains(&coord.1) {
-                    push(coord, &tile.rows);
-                }
+            if fx.trails {
+                self.staging_trail
+                    .extend_from_slice(m.map_or(&zero_meta, |m| &m.trail));
+            }
+            if let Some(prev) = &prev {
+                self.staging_prev
+                    .push(prev.get(&coord).map_or([0; 128], |t| pack_rows(&t.rows)));
             }
         }
 
-        // Never exceed what a single storage binding can address.
-        let max_tiles = self.device.limits().max_storage_buffer_binding_size as usize
-            / std::mem::size_of::<GpuTile>();
-        self.staging.truncate(max_tiles);
-        if self.staging.len() > self.tile_capacity {
-            self.tile_capacity = self.staging.len().next_power_of_two().min(max_tiles);
-            self.tile_buf = create_tile_buffer(&self.device, self.tile_capacity);
+        let tiles_bytes: &[u8] = bytemuck::cast_slice(&self.staging);
+        let prev_bytes: &[u8] = bytemuck::cast_slice(&self.staging_prev);
+        let mut regrown = false;
+        for (buf, bytes) in [
+            (&mut self.tile_buf, tiles_bytes),
+            (&mut self.age_buf, &self.staging_age[..]),
+            (&mut self.trail_buf, &self.staging_trail[..]),
+            (&mut self.prev_buf, prev_bytes),
+        ] {
+            regrown |= buf.reserve(&self.device, bytes.len() as u64);
+            if !bytes.is_empty() {
+                self.queue.write_buffer(&buf.buf, 0, bytes);
+            }
+        }
+        if regrown {
             self.bind_group = create_bind_group(
                 &self.device,
                 &self.bind_layout,
                 &self.uniforms,
-                &self.tile_buf,
+                [
+                    &self.tile_buf,
+                    &self.age_buf,
+                    &self.trail_buf,
+                    &self.prev_buf,
+                ],
             );
-        }
-        if !self.staging.is_empty() {
-            self.queue
-                .write_buffer(&self.tile_buf, 0, bytemuck::cast_slice(&self.staging));
         }
         self.tile_count = self.staging.len() as u32;
         self.upload_key = Some(UploadKey {
             tiles: snap.tiles.clone(),
+            prev,
+            meta,
+            effects: fx,
             center_tile,
             range,
         });
@@ -412,10 +618,10 @@ fn pack_rows(rows: &[u64; 64]) -> [u32; 128] {
     out
 }
 
-fn create_tile_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("tiles"),
-        size: (capacity * std::mem::size_of::<GpuTile>()) as u64,
+        label: Some(label),
+        size,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
@@ -425,21 +631,22 @@ fn create_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     uniforms: &wgpu::Buffer,
-    tiles: &wgpu::Buffer,
+    storage: [&StorageBuf; 4],
 ) -> wgpu::BindGroup {
+    let mut entries = vec![wgpu::BindGroupEntry {
+        binding: 0,
+        resource: uniforms.as_entire_binding(),
+    }];
+    for (binding, buf) in (1..).zip(storage) {
+        entries.push(wgpu::BindGroupEntry {
+            binding,
+            resource: buf.buf.as_entire_binding(),
+        });
+    }
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tiles"),
         layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniforms.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: tiles.as_entire_binding(),
-            },
-        ],
+        entries: &entries,
     })
 }
 

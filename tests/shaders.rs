@@ -13,3 +13,8 @@ fn validate(src: &str) {
 fn tiles_wgsl_is_valid() {
     validate(include_str!("../src/render/tiles.wgsl"));
 }
+
+#[test]
+fn density_wgsl_is_valid() {
+    validate(include_str!("../src/render/density.wgsl"));
+}
