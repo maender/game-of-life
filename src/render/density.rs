@@ -125,7 +125,8 @@ struct GridKey {
     center: (f64, f64),
     px_per_cell: f64,
     screen: (f64, f64),
-    div: u32,
+    /// Texture size: the surface size (the shader's `screen`) / `div`.
+    out: (u32, u32),
 }
 
 impl GridKey {
@@ -134,7 +135,7 @@ impl GridKey {
             && self.center == other.center
             && self.px_per_cell == other.px_per_cell
             && self.screen == other.screen
-            && self.div == other.div
+            && self.out == other.out
     }
 }
 
@@ -248,18 +249,20 @@ impl DensityView {
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
+        // Sized from the same `screen` as the shader, so texels map 1:1 (or
+        // 2:1) onto the surface.
+        let out_w = ((screen[0] as u32) / self.div).max(1);
+        let out_h = ((screen[1] as u32) / self.div).max(1);
         let key = GridKey {
             tiles: tiles.clone(),
             center: cam.center,
             px_per_cell: cam.px_per_cell,
             screen: cam.screen,
-            div: self.div,
+            out: (out_w, out_h),
         };
         if self.key.as_ref().is_some_and(|k| k.same_as(&key)) {
             return;
         }
-        let out_w = ((cam.screen.0 as u32) / self.div).max(1);
-        let out_h = ((cam.screen.1 as u32) / self.div).max(1);
         let start = Instant::now();
         let grid = density_grid(tiles, cam, out_w, out_h);
         let secs = start.elapsed().as_secs_f64();

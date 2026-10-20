@@ -1,6 +1,6 @@
 use crate::sim::{split, step_tile, update_meta, MetaMap, Neighborhood, Tile, TileCoord, TILE};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 pub type TileMap = FxHashMap<TileCoord, Tile>;
@@ -100,7 +100,7 @@ impl Universe {
         let old_tiles = self.tiles.clone();
 
         // Find candidate tiles: existing tiles + neighbors on borders with live cells
-        let mut candidates = std::collections::HashSet::new();
+        let mut candidates = FxHashSet::default();
 
         for (&(tx, ty), tile) in old_tiles.iter() {
             candidates.insert((tx, ty));
