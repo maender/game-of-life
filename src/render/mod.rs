@@ -208,13 +208,28 @@ impl Renderer {
         _anim_t: f32,
         ui: Option<(&egui::Context, egui::FullOutput)>,
     ) {
+        // egui sends each texture delta only once: apply uploads before anything
+        // can fail, and keep the frees so they happen whatever the outcome.
+        let mut ui_frame = None;
+        let mut free = Vec::new();
+        if let Some((ctx, output)) = ui {
+            for (id, delta) in &output.textures_delta.set {
+                self.egui
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+            free = output.textures_delta.free;
+            ui_frame = Some((ctx, output.shapes, output.pixels_per_point));
+        }
+
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.config);
+            Err(e) => {
+                if matches!(e, wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) {
+                    self.surface.configure(&self.device, &self.config);
+                }
+                self.free_egui_textures(&free);
                 return;
             }
-            Err(_) => return,
         };
         let view = frame
             .texture
@@ -254,20 +269,16 @@ impl Renderer {
         // Prepare egui buffers and textures before the pass.
         let mut egui_frame = None;
         let mut extra_cmds = Vec::new();
-        if let Some((ctx, output)) = ui {
+        if let Some((ctx, shapes, pixels_per_point)) = ui_frame {
             let screen = egui_wgpu::ScreenDescriptor {
                 size_in_pixels: [self.config.width, self.config.height],
-                pixels_per_point: output.pixels_per_point,
+                pixels_per_point,
             };
-            let jobs = ctx.tessellate(output.shapes, output.pixels_per_point);
-            for (id, delta) in &output.textures_delta.set {
-                self.egui
-                    .update_texture(&self.device, &self.queue, *id, delta);
-            }
+            let jobs = ctx.tessellate(shapes, pixels_per_point);
             extra_cmds =
                 self.egui
                     .update_buffers(&self.device, &self.queue, &mut encoder, &jobs, &screen);
-            egui_frame = Some((jobs, screen, output.textures_delta.free));
+            egui_frame = Some((jobs, screen));
         }
 
         {
@@ -293,7 +304,7 @@ impl Renderer {
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.draw(0..6, 0..self.tile_count);
             }
-            if let Some((jobs, screen, _)) = &egui_frame {
+            if let Some((jobs, screen)) = &egui_frame {
                 self.egui.render(&mut pass, jobs, screen);
             }
         }
@@ -306,10 +317,12 @@ impl Renderer {
         self.window.pre_present_notify();
         frame.present();
 
-        if let Some((_, _, free)) = egui_frame {
-            for id in &free {
-                self.egui.free_texture(id);
-            }
+        self.free_egui_textures(&free);
+    }
+
+    fn free_egui_textures(&mut self, ids: &[egui::TextureId]) {
+        for id in ids {
+            self.egui.free_texture(id);
         }
     }
 
@@ -335,18 +348,14 @@ impl Renderer {
         self.staging.clear();
         let (tx0, ty0, tx1, ty1) = range;
         let mut push = |coord: TileCoord, rows: &[u64; 64]| {
-            let mut t = GpuTile {
+            let t = GpuTile {
                 rel: [
                     (coord.0 - center_tile.0) as i32,
                     (coord.1 - center_tile.1) as i32,
                 ],
                 abs_lo: [coord.0 as i32, coord.1 as i32],
-                rows: [0; 128],
+                rows: pack_rows(rows),
             };
-            for (i, row) in rows.iter().enumerate() {
-                t.rows[2 * i] = *row as u32;
-                t.rows[2 * i + 1] = (*row >> 32) as u32;
-            }
             self.staging.push(t);
         };
         let range_len = ((tx1 - tx0 + 1) as u128) * ((ty1 - ty0 + 1) as u128);
@@ -366,8 +375,12 @@ impl Renderer {
             }
         }
 
+        // Never exceed what a single storage binding can address.
+        let max_tiles = self.device.limits().max_storage_buffer_binding_size as usize
+            / std::mem::size_of::<GpuTile>();
+        self.staging.truncate(max_tiles);
         if self.staging.len() > self.tile_capacity {
-            self.tile_capacity = self.staging.len().next_power_of_two();
+            self.tile_capacity = self.staging.len().next_power_of_two().min(max_tiles);
             self.tile_buf = create_tile_buffer(&self.device, self.tile_capacity);
             self.bind_group = create_bind_group(
                 &self.device,
@@ -387,6 +400,16 @@ impl Renderer {
             range,
         });
     }
+}
+
+/// Splits 64-bit rows into u32 pairs, low word first (columns 0..31, then 32..63).
+fn pack_rows(rows: &[u64; 64]) -> [u32; 128] {
+    let mut out = [0u32; 128];
+    for (i, row) in rows.iter().enumerate() {
+        out[2 * i] = *row as u32;
+        out[2 * i + 1] = (*row >> 32) as u32;
+    }
+    out
 }
 
 fn create_tile_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
@@ -473,4 +496,22 @@ fn rgb_to_hsl([r, g, b]: [f32; 3]) -> [f32; 3] {
         (r - g) / d + 4.0
     };
     [h * 60.0, s, l]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_rows_low_word_first() {
+        let mut rows = [0u64; 64];
+        rows[5] = (1 << 0) | (1 << 31) | (1 << 32) | (1 << 63);
+        let packed = pack_rows(&rows);
+        assert_eq!(packed[10], (1 << 0) | (1 << 31));
+        assert_eq!(packed[11], (1 << 0) | (1 << 31));
+        assert!(packed
+            .iter()
+            .enumerate()
+            .all(|(i, w)| i == 10 || i == 11 || *w == 0));
+    }
 }
