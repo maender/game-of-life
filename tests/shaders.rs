@@ -18,3 +18,8 @@ fn tiles_wgsl_is_valid() {
 fn density_wgsl_is_valid() {
     validate(include_str!("../src/render/density.wgsl"));
 }
+
+#[test]
+fn grid_wgsl_is_valid() {
+    validate(include_str!("../src/render/grid.wgsl"));
+}

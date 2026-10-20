@@ -23,6 +23,7 @@ L'application démarre en plein écran, en pause, avec une soupe aléatoire de l
   - **âge** : les cellules nées récemment sont claires, les anciennes plus sombres ;
   - **traînées** : une cellule morte s'efface progressivement ;
   - **naissance animée** : les cellules grossissent et rétrécissent en douceur.
+- **Grille activable** : lignes fines gris clair sur les bords des cellules, qui s'effacent quand on dézoome.
 - **Mode dégradé** : carrés pleins, sans effets, pour la vitesse maximale.
 - **Panneau réductible** avec les statistiques : génération, population, images par seconde, générations par seconde, zoom.
 
@@ -42,6 +43,7 @@ L'application démarre en plein écran, en pause, avec une soupe aléatoire de l
 | `H` | Recentrer sur la vie |
 | `S` | Style suivant |
 | `1` `2` `3` | Effets âge / traînées / animation |
+| `G` | Grille on/off |
 | `L` | Mode dégradé |
 | `Tab` | Réduire / ouvrir le panneau |
 | `F` | Plein écran on/off |

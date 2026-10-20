@@ -191,6 +191,11 @@ fn full_panel(
             }
         }
     });
+    row(ui, "G", |ui| {
+        if ui.selectable_label(s.grid, "Grille").clicked() {
+            actions.push(Action::ToggleGrid);
+        }
+    });
     row(ui, "L", |ui| {
         if ui.selectable_label(s.degraded, "⚡ Mode dégradé").clicked() {
             actions.push(Action::ToggleDegraded);
@@ -455,6 +460,54 @@ mod tests {
         frame(vec![esc], &mut s);
         frame(vec![], &mut s);
         assert!(!egui::Popup::is_any_open(&ctx), "Escape closes the popup");
+    }
+
+    /// Clicking the "Grille" toggle in the Apparence section asks for ToggleGrid.
+    #[test]
+    fn grid_button_emits_toggle_grid() {
+        let ctx = egui::Context::default();
+        let tiles = Arc::new(TileMap::default());
+        let snap = Snapshot {
+            tiles: tiles.clone(),
+            prev: tiles,
+            meta: None,
+            generation: 0,
+            population: 0,
+            running: false,
+            gens_per_sec: 0.0,
+            published_at: Instant::now(),
+        };
+        let cam = Camera {
+            center: (0.0, 0.0),
+            px_per_cell: 8.0,
+            screen: (800.0, 600.0),
+        };
+        let mut s = Settings::default();
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let mut actions = Vec::new();
+            let out = ctx.run(input, |ctx| {
+                actions = draw(ctx, &mut s, &snap, Speed::Gps(30), 60.0, &cam, None);
+            });
+            (out, actions)
+        };
+        frame(vec![]); // the first pass only measures the layout
+        let (out, _) = frame(vec![]);
+        let pos = find_text(&out.shapes, "Grille")
+            .expect("grid toggle drawn")
+            .center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(pos), button(true)]);
+        let (_, actions) = frame(vec![button(false)]);
+        assert_eq!(actions, vec![Action::ToggleGrid]);
     }
 
     fn find_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Rect> {

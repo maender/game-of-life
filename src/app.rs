@@ -270,6 +270,7 @@ impl App {
             Action::ToggleTrails => s.effect_trails = !s.effect_trails,
             Action::ToggleAnim => s.effect_anim = !s.effect_anim,
             Action::ToggleDegraded => s.degraded = !s.degraded,
+            Action::ToggleGrid => s.grid = !s.grid,
             Action::TogglePanel => s.panel_open = !s.panel_open,
             Action::ToggleFullscreen => {
                 if let Some(gfx) = &self.gfx {

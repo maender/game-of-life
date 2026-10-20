@@ -45,6 +45,8 @@ pub struct Settings {
     pub effect_trails: bool,
     pub effect_anim: bool,
     pub degraded: bool,
+    /// Light grid lines on cell boundaries.
+    pub grid: bool,
     /// Randomization density.
     pub density: f32,
     pub panel_open: bool,
@@ -66,6 +68,7 @@ impl Default for Settings {
             effect_trails: false,
             effect_anim: false,
             degraded: false,
+            grid: false,
             density: 0.35,
             panel_open: true,
             tool_erase: false,
@@ -90,5 +93,10 @@ mod tests {
         assert_eq!(CellStyle::Rounded.next(), CellStyle::Dots);
         assert_eq!(CellStyle::Dots.next(), CellStyle::Neon);
         assert_eq!(CellStyle::Neon.next(), CellStyle::Candy);
+    }
+
+    #[test]
+    fn grid_is_off_by_default() {
+        assert!(!Settings::default().grid);
     }
 }

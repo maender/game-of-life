@@ -1,6 +1,7 @@
 //! GPU rendering of the universe (cells) and of the egui overlay.
 
 mod density;
+mod grid;
 
 pub use density::density_grid;
 
@@ -9,6 +10,7 @@ use crate::ui::{CellStyle, Settings};
 use crate::view::Camera;
 use bytemuck::{Pod, Zeroable};
 use density::DensityView;
+use grid::GridView;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use winit::window::Window;
@@ -157,6 +159,7 @@ pub struct Renderer {
     staging_trail: Vec<u8>,
     staging_prev: Vec<[u32; 128]>,
     density: DensityView,
+    grid: GridView,
     egui: egui_wgpu::Renderer,
     window: Arc<Window>,
 }
@@ -284,6 +287,7 @@ impl Renderer {
             [&tile_buf, &age_buf, &trail_buf, &prev_buf],
         );
         let density = DensityView::new(&device, format);
+        let grid = GridView::new(&device, format);
         let egui = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
 
         Renderer {
@@ -306,6 +310,7 @@ impl Renderer {
             staging_trail: Vec::new(),
             staging_prev: Vec::new(),
             density,
+            grid,
             egui,
             window,
         }
@@ -357,6 +362,7 @@ impl Renderer {
         let srgb_target = self.config.format.is_srgb();
         let screen = [self.config.width as f32, self.config.height as f32];
 
+        self.grid.prepare(&self.queue, cam, s.grid, srgb_target);
         let density_view = cam.px_per_cell < DENSITY_PX_PER_CELL;
         if density_view {
             self.density.prepare(
@@ -443,6 +449,8 @@ impl Renderer {
                     occlusion_query_set: None,
                 })
                 .forget_lifetime();
+            // Under the cells, so they stay crisp on top.
+            self.grid.draw(&mut pass);
             if density_view {
                 self.density.draw(&mut pass);
             } else if self.tile_count > 0 {
