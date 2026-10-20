@@ -117,9 +117,10 @@ impl Drop for SimHandle {
 
 pub fn spawn(universe: Universe) -> SimHandle {
     let (tx, rx) = channel();
+    let tiles = universe.tiles().clone();
     let snapshot_swap = Arc::new(ArcSwap::from_pointee(Snapshot {
-        tiles: universe.tiles().clone(),
-        prev: universe.tiles().clone(),
+        tiles: tiles.clone(),
+        prev: tiles,
         meta: universe.meta().cloned(),
         generation: universe.generation(),
         population: universe.population(),
@@ -233,11 +234,74 @@ fn run_simulation_loop(
             let cutoff = Instant::now() - gen_window;
             gen_times.retain(|&t| t > cutoff);
 
-            // Sleep according to speed (no sleep for Max)
+            // Wait according to speed, processing commands as they arrive
             match speed {
                 Speed::Gps(gps) => {
                     let target_duration = Duration::from_secs_f64(1.0 / gps as f64);
-                    thread::sleep(target_duration);
+                    let deadline = Instant::now() + target_duration;
+
+                    // Wait until deadline, processing commands as they arrive
+                    loop {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+
+                        let timeout = deadline - now;
+                        match rx.recv_timeout(timeout) {
+                            Ok(cmd) => {
+                                match cmd {
+                                    SimCommand::Shutdown => return,
+                                    SimCommand::Pause => {
+                                        running = false;
+                                        publish_snapshot(
+                                            &snapshot,
+                                            &universe,
+                                            false,
+                                            &gen_times,
+                                            gen_window,
+                                        );
+                                        break;
+                                    }
+                                    SimCommand::Play => {
+                                        // Already running, ignore
+                                    }
+                                    SimCommand::Step => {
+                                        // Ignored while running
+                                    }
+                                    SimCommand::SetSpeed(s) => {
+                                        speed = s;
+                                        // Speed change takes effect on next step, keep waiting
+                                    }
+                                    SimCommand::Edit(edits) => {
+                                        apply_edits(&mut universe, edits);
+                                        publish_edit_snapshot(&snapshot, &universe, running);
+                                        // Continue waiting after edit
+                                    }
+                                    SimCommand::Randomize { rect, density } => {
+                                        universe.fill_random(rect, density, randomize_seed_counter);
+                                        randomize_seed_counter += 1;
+                                        publish_edit_snapshot(&snapshot, &universe, running);
+                                        // Continue waiting
+                                    }
+                                    SimCommand::Clear => {
+                                        universe.clear();
+                                        publish_edit_snapshot(&snapshot, &universe, running);
+                                        // Continue waiting
+                                    }
+                                    SimCommand::SetEffects(on) => {
+                                        universe.set_effects(on);
+                                        publish_edit_snapshot(&snapshot, &universe, running);
+                                        // Continue waiting
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // Timeout reached or channel disconnected
+                                break;
+                            }
+                        }
+                    }
                 }
                 Speed::Max => {
                     // No sleep, run as fast as possible
@@ -437,7 +501,7 @@ mod tests {
         let snapshot = handle.snapshot();
         assert!(
             snapshot.generation <= 2,
-            "Generation {} exceeds expected 2 (at 1 GPS, ~0.1s should yield ≤2 steps)",
+            "Generation {} exceeds 2 (at 1 GPS, ~0.2s total elapsed time with timing slack)",
             snapshot.generation
         );
     }
@@ -535,5 +599,92 @@ mod tests {
 
         let (_, lx2, _) = crate::sim::split(2, 1);
         assert!(tiles_tile.get(lx2, ly), "Tiles should have cell (2,1)");
+    }
+
+    #[test]
+    fn edit_responsive_at_slow_speed() {
+        let universe = Universe::new();
+        let handle = spawn(universe);
+
+        handle.send(SimCommand::SetSpeed(Speed::Gps(1)));
+        handle.send(SimCommand::Play);
+
+        sleep(Duration::from_millis(100));
+
+        // Send edit for a 2x2 block
+        let edits = vec![
+            (500, 500, true),
+            (501, 500, true),
+            (500, 501, true),
+            (501, 501, true),
+        ];
+        handle.send(SimCommand::Edit(edits));
+
+        // Edit should be applied within 0.3s total (not waiting for full 1s sleep)
+        let timeout = Duration::from_millis(300);
+        let start = Instant::now();
+        loop {
+            let snapshot = handle.snapshot();
+            let (tc, lx0, ly0) = crate::sim::split(500, 500);
+            if let Some(tile) = snapshot.tiles.get(&tc) {
+                if tile.get(lx0, ly0) {
+                    // Edit applied successfully
+                    let response_time = start.elapsed();
+                    assert!(
+                        response_time < timeout,
+                        "Edit took {}ms to apply, should be < 300ms",
+                        response_time.as_millis()
+                    );
+                    break;
+                }
+            }
+
+            if start.elapsed() > timeout {
+                panic!("Edit not applied within 300ms at Gps(1)");
+            }
+
+            sleep(Duration::from_millis(10));
+        }
+
+        handle.send(SimCommand::Pause);
+    }
+
+    #[test]
+    fn pause_responsive_at_slow_speed() {
+        let universe = Universe::new();
+        let handle = spawn(universe);
+
+        handle.send(SimCommand::SetSpeed(Speed::Gps(1)));
+        handle.send(SimCommand::Play);
+
+        sleep(Duration::from_millis(100));
+
+        handle.send(SimCommand::Pause);
+
+        // Pause should take effect within 0.3s (not waiting for full 1s sleep)
+        let timeout = Duration::from_millis(300);
+        let start = Instant::now();
+        loop {
+            let snapshot = handle.snapshot();
+            if !snapshot.running {
+                // Pause took effect
+                let response_time = start.elapsed();
+                assert!(
+                    response_time < timeout,
+                    "Pause took {}ms to take effect, should be < 300ms",
+                    response_time.as_millis()
+                );
+                break;
+            }
+
+            if start.elapsed() > timeout {
+                panic!("Pause did not take effect within 300ms at Gps(1)");
+            }
+
+            sleep(Duration::from_millis(10));
+        }
+
+        let snapshot = handle.snapshot();
+        assert!(!snapshot.running);
     }
 }
