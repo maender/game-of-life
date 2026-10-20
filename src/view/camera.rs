@@ -257,9 +257,12 @@ mod tests {
             let dy = (y1 - y0).abs();
             let chebyshev = dx.max(dy);
             assert_eq!(
-                chebyshev, 1,
+                chebyshev,
+                1,
                 "Non-8-connected at index {}: {:?} -> {:?}",
-                i, cells[i], cells[i + 1]
+                i,
+                cells[i],
+                cells[i + 1]
             );
         }
     }

@@ -170,7 +170,10 @@ impl Universe {
             .collect();
 
         // Update population
-        self.population = new_tiles.values().map(|tile| tile.population() as u64).sum();
+        self.population = new_tiles
+            .values()
+            .map(|tile| tile.population() as u64)
+            .sum();
         self.generation += 1;
         self.tiles = Arc::new(new_tiles);
 
@@ -513,7 +516,8 @@ mod tests {
                     let u_alive = u.get(x, y);
                     let naive_alive = naive_cells.contains(&(x, y));
                     assert_eq!(
-                        u_alive, naive_alive,
+                        u_alive,
+                        naive_alive,
                         "Mismatch at generation {} position ({}, {})",
                         gen + 1,
                         x,

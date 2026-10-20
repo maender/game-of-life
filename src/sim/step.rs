@@ -149,7 +149,8 @@ pub fn step_tile(nb: &Neighborhood) -> Tile {
 
 #[cfg(test)]
 pub(crate) fn step_naive(cells: &HashSet<(i64, i64)>) -> HashSet<(i64, i64)> {
-    let mut neighbor_counts: std::collections::HashMap<(i64, i64), u8> = std::collections::HashMap::new();
+    let mut neighbor_counts: std::collections::HashMap<(i64, i64), u8> =
+        std::collections::HashMap::new();
 
     // Count neighbors for all cells and their neighbors
     for &(x, y) in cells {
@@ -303,11 +304,11 @@ mod tests {
             }
 
             let nb = Neighborhood {
-                c: &tiles[1][1],  // center
-                n: Some(&tiles[0][1]),  // north
-                s: Some(&tiles[2][1]),  // south
-                w: Some(&tiles[1][0]),  // west
-                e: Some(&tiles[1][2]),  // east
+                c: &tiles[1][1],       // center
+                n: Some(&tiles[0][1]), // north
+                s: Some(&tiles[2][1]), // south
+                w: Some(&tiles[1][0]), // west
+                e: Some(&tiles[1][2]), // east
                 nw: Some(&tiles[0][0]),
                 ne: Some(&tiles[0][2]),
                 sw: Some(&tiles[2][0]),

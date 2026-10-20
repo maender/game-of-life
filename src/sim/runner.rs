@@ -166,11 +166,7 @@ fn run_simulation_loop(
                             SimCommand::Pause => {
                                 running = false;
                                 publish_snapshot(
-                                    &snapshot,
-                                    &universe,
-                                    false,
-                                    &gen_times,
-                                    gen_window,
+                                    &snapshot, &universe, false, &gen_times, gen_window,
                                 );
                                 break;
                             }
@@ -185,20 +181,28 @@ fn run_simulation_loop(
                             }
                             SimCommand::Edit(edits) => {
                                 apply_edits(&mut universe, edits);
-                                publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
+                                publish_snapshot(
+                                    &snapshot, &universe, running, &gen_times, gen_window,
+                                );
                             }
                             SimCommand::Randomize { rect, density } => {
                                 universe.fill_random(rect, density, randomize_seed_counter);
                                 randomize_seed_counter += 1;
-                                publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
+                                publish_snapshot(
+                                    &snapshot, &universe, running, &gen_times, gen_window,
+                                );
                             }
                             SimCommand::Clear => {
                                 universe.clear();
-                                publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
+                                publish_snapshot(
+                                    &snapshot, &universe, running, &gen_times, gen_window,
+                                );
                             }
                             SimCommand::SetEffects(on) => {
                                 universe.set_effects(on);
-                                publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
+                                publish_snapshot(
+                                    &snapshot, &universe, running, &gen_times, gen_window,
+                                );
                             }
                         }
                     }
@@ -259,11 +263,7 @@ fn run_simulation_loop(
                                     SimCommand::Pause => {
                                         running = false;
                                         publish_snapshot(
-                                            &snapshot,
-                                            &universe,
-                                            false,
-                                            &gen_times,
-                                            gen_window,
+                                            &snapshot, &universe, false, &gen_times, gen_window,
                                         );
                                         break;
                                     }
@@ -279,23 +279,31 @@ fn run_simulation_loop(
                                     }
                                     SimCommand::Edit(edits) => {
                                         apply_edits(&mut universe, edits);
-                                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
+                                        publish_snapshot(
+                                            &snapshot, &universe, running, &gen_times, gen_window,
+                                        );
                                         // Continue waiting after edit
                                     }
                                     SimCommand::Randomize { rect, density } => {
                                         universe.fill_random(rect, density, randomize_seed_counter);
                                         randomize_seed_counter += 1;
-                                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
+                                        publish_snapshot(
+                                            &snapshot, &universe, running, &gen_times, gen_window,
+                                        );
                                         // Continue waiting
                                     }
                                     SimCommand::Clear => {
                                         universe.clear();
-                                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
+                                        publish_snapshot(
+                                            &snapshot, &universe, running, &gen_times, gen_window,
+                                        );
                                         // Continue waiting
                                     }
                                     SimCommand::SetEffects(on) => {
                                         universe.set_effects(on);
-                                        publish_snapshot(&snapshot, &universe, running, &gen_times, gen_window);
+                                        publish_snapshot(
+                                            &snapshot, &universe, running, &gen_times, gen_window,
+                                        );
                                         // Continue waiting
                                     }
                                 }

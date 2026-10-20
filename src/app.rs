@@ -395,7 +395,10 @@ mod tests {
         let (stroke, cells) = extend_stroke(&cam, last, 400.0 + 3.0 * 8.0, 300.0);
         assert_eq!(stroke, Some((last.0 + 3, last.1)));
         assert_eq!(cells.len(), 4);
-        assert_eq!(extend_stroke(&cam, last, 401.0, 300.0), (Some(last), vec![]));
+        assert_eq!(
+            extend_stroke(&cam, last, 401.0, 300.0),
+            (Some(last), vec![])
+        );
     }
 
     #[test]

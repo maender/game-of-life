@@ -389,7 +389,10 @@ mod tests {
             }
             let all = texts.concat();
             assert!(all.contains(shown), "running={running}: missing {shown}");
-            assert!(!all.contains(hidden), "running={running}: unexpected {hidden}");
+            assert!(
+                !all.contains(hidden),
+                "running={running}: unexpected {hidden}"
+            );
         }
     }
 
