@@ -12,7 +12,7 @@ const GRID_RGB: [f32; 3] = [
     0xd9 as f32 / 255.0,
 ];
 /// Line opacity once fully faded in.
-pub const GRID_ALPHA: f32 = 0.11;
+pub const GRID_ALPHA: f32 = 0.2;
 /// The grid starts fading in at this zoom...
 const FADE_START: f64 = 4.0;
 /// ...and is fully visible from this one.
